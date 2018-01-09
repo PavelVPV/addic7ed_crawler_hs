@@ -1,15 +1,24 @@
-{-# LANGUAGE OverloadedStrings #-}
+--{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE OverloadedStrings, FlexibleInstances, MultiParamTypeClasses, DeriveDataTypeable, CPP #-}
 
+import Data.Conduit.Binary (sinkFile)
 import Data.List (isInfixOf)
 import Network.HTTP.Base (urlEncode)
-import Network.HTTP.Conduit (httpLbs, parseRequest, newManager, requestHeaders, Request, responseBody)
+import Network.HTTP.Conduit (http, lbsResponse, httpLbs, parseRequest, newManager, requestHeaders, Request, responseBody, responseHeaders)
 import Network.HTTP.Client (defaultManagerSettings)
+import Network.HTTP.Types.Header
 import Text.XML (Node (NodeContent))
+import qualified Data.Conduit as C
+import qualified Data.ByteString as B
 import qualified Data.Text as T
 import qualified Data.Text.IO as T
 import qualified Text.HTML.DOM as D
+import qualified Data.Text.Encoding as TE
+import Data.List.Split (splitOn)
 import Text.XML.Cursor (Cursor, content, element, fromDocument, child, attributeIs, attribute, node, descendant, following,
                         (&/), ($//), (&|), (>=>))
+import Control.Monad.Trans.Resource (runResourceT)
+import Control.Monad.IO.Class -- liftIO
 
 addictedUrl = "http://www.addic7ed.com/"
 searchExt = "search.php?Submit=Search&search="
@@ -21,6 +30,17 @@ searchExt = "search.php?Submit=Search&search="
 setUserAgent :: Request -> Request
 setUserAgent req = req{requestHeaders = ("User-agent", "Mozilla/5.0 (Windows NT 10.0; WOW64; rv:44.0) Gecko/20100101 Firefox/44.0") : requestHeaders req}
 
+setReferer :: B.ByteString -> Request -> Request
+setReferer r req = req{requestHeaders = ("Referer", r) : requestHeaders req}
+
+getContentDisposition :: ResponseHeaders -> Maybe String
+getContentDisposition [] = Nothing
+getContentDisposition ((a,b):xs) =
+    if (a == "Content-Disposition") then
+        Just (T.unpack $ TE.decodeUtf8 b)
+    else
+        getContentDisposition xs
+
 loadPage url = do
     putStrLn ("URL: " ++ url)
 
@@ -30,6 +50,30 @@ loadPage url = do
     let page = responseBody response
     let cursor = fromDocument $ D.parseLBS page
     return cursor
+
+removeColon s = let repl ':' = '_'
+                    repl c = c
+                 in map repl s
+
+loadFile :: String -> String -> IO ()
+loadFile r url = do
+    putStrLn ("File URL: " ++ url)
+
+    request <- (setReferer . TE.encodeUtf8 $ T.pack r) <$> setUserAgent <$> parseRequest url
+    manager <- newManager defaultManagerSettings
+
+    runResourceT $ do
+        response <- http request manager
+
+        let cd = getContentDisposition $ responseHeaders response
+        let fileName = (!! 1) <$> ((splitOn "\"") <$> cd)
+
+        liftIO $ putStrLn $ "File name: " ++ show fileName
+
+        case fileName of
+            Nothing -> liftIO $ putStrLn "Failed to parse file name"
+            Just f ->
+                responseBody response C.$$+- sinkFile f
 
 -------------------------------------------------------------------------------
 -- Movie search
@@ -42,7 +86,7 @@ extractMoviesNames = T.unpack . T.concat . content
 
 extractHrefs = T.unpack . T.concat . attribute "href"
 
-getMovies c = 
+getMovies c =
     let hrefs = findMoviesHrefs c
     in map (\c -> ((extractHrefs c), (extractMoviesNames ((child c) !! 0)))) hrefs
 
@@ -67,7 +111,7 @@ findSubsStat = element "td" >=> attributeIs "class" "newsDate" >=> attributeIs "
 
 findSubsHrefs = element "a" >=> attributeIs "class" "buttonDownload"
 
-extractContent z = 
+extractContent z =
     let b = [ x | x@NodeContent {} <- ([ node y | y <- z ]) ]
     in map (T.unpack . (\(NodeContent a) -> a)) b
 
@@ -76,11 +120,11 @@ getSubsLang c =
     -- NOTE: language contains some strange content some filter was added to remove it
     in filter (not . isInfixOf "\n\t") $ extractContent langs
 
-getSubsHrefs c = 
+getSubsHrefs c =
     let hrefs = (findSubsTable >=> findSubsHrefs) c
     in map extractHrefs hrefs
 
-getSubsStat c = 
+getSubsStat c =
     let hrefs = (findSubsTable >=> findSubsStat) c
     in extractContent hrefs
 
@@ -90,10 +134,10 @@ mergeResults (a:as) (b:bs) = (a,b) : mergeResults as bs
 
 searchSubs url = do
     cursor <- loadPage url
-    return $ mergeResults 
+    return $ mergeResults
         (cursor $// (getSubsHrefs))
-        (map 
-            (\(a,b) -> a ++ " - " ++ b) 
+        (map
+            (\(a,b) -> a ++ " - " ++ b)
             (mergeResults
                 (cursor $// (getSubsLang))
                 (cursor $// (getSubsStat))))
@@ -101,10 +145,10 @@ searchSubs url = do
 searchSubsFile f = do
     file <- D.readFile f
     let cursor = fromDocument file
-    return $ mergeResults 
+    return $ mergeResults
         (cursor $// (getSubsHrefs))
-        (map 
-            (\(a,b) -> a ++ " - " ++ b) 
+        (map
+            (\(a,b) -> a ++ " - " ++ b)
             (mergeResults
                 (cursor $// (getSubsLang))
                 (cursor $// (getSubsStat))))
@@ -117,12 +161,12 @@ numerate :: Integer -> [String] -> [String]
 numerate _ [] = []
 numerate i (x:xs) = ((show i) ++ ": " ++ x) : (numerate (i + 1) xs)
 
----chooseLink :: [(String, String)] -> IO (Maybe String)
+chooseLink :: [(String, String)] -> IO (Maybe String)
 chooseLink [] = do
     putStrLn "No result"
     return Nothing
-chooseLink res = do 
-    -- Print search result 
+chooseLink res = do
+    -- Print search result
     putStrLn "Please choise the result or -1 to abort:"
     -- NOTE: Filter is added because subtitles comes with \n
     mapM_ (putStrLn) $ numerate 0 $ (map (filter (/= '\n') . snd) res)
@@ -155,12 +199,15 @@ main = do
     movieChoise <- chooseLink searchRes
     let movie = composeLink movieChoise
     case movie of
-        Nothing -> return Nothing
+        Nothing -> return ()
         Just x -> do
             subs <- searchSubs x
             subsChoise <- chooseLink subs
             let downloadLink = composeLink subsChoise
-            return downloadLink
+            case downloadLink of
+                Nothing -> return ()
+                Just y -> do
+                    loadFile x y
 
 -------------------------------------------------------------------------------
 -- Test functions
