@@ -20,6 +20,7 @@ import Text.XML.Cursor (Cursor, content, element, fromDocument, child, attribute
 import Control.Monad.Trans.Resource (runResourceT)
 import Control.Monad.Trans.Maybe
 import Control.Monad.IO.Class -- liftIO
+import Control.Monad (liftM)
 
 addictedUrl = "http://www.addic7ed.com/"
 searchExt = "search.php?Submit=Search&search="
@@ -54,9 +55,10 @@ removeColon s = let repl ':' = '_'
                     repl c = c
                  in map repl s
 
-loadFile :: String -> String -> IO ()
-loadFile r url = do
+loadFile :: String -> String -> MaybeT IO String
+loadFile r url = MaybeT $ do
     putStrLn ("File URL: " ++ url)
+    putStrLn ("Referer: " ++ r)
 
     request <- (setReferer . TE.encodeUtf8 $ T.pack r) <$> setUserAgent <$> parseRequest url
     manager <- newManager defaultManagerSettings
@@ -70,9 +72,10 @@ loadFile r url = do
         liftIO $ putStrLn $ "File name: " ++ show fileName
 
         case fileName of
-            Nothing -> liftIO $ putStrLn "Failed to parse file name"
-            Just f ->
+            Nothing -> return Nothing
+            Just f -> do
                 responseBody response C.$$+- sinkFile f
+                return $ Just f
 
 -------------------------------------------------------------------------------
 -- Movie search
@@ -87,16 +90,13 @@ extractMoviesNames = T.unpack . T.concat . content
 extractHrefs :: Cursor -> String
 extractHrefs = T.unpack . T.concat . attribute "href"
 
-getMovies :: Cursor -> Maybe [(String, String)]
+getMovies :: Cursor -> [(String, String)]
 getMovies c =
     let hrefs = findMoviesHrefs c
-    if (length hrefs) == 0 then
-        Nothing
-    else
-        Just (map (\c -> ((extractHrefs c), (extractMoviesNames ((child c) !! 0)))) hrefs)
+    in map (\c -> ((extractHrefs c), (extractMoviesNames ((child c) !! 0)))) hrefs
 
-searchMovie :: String -> MaybeT IO [(String, String)]
-searchMovie w = MaybeT $ do
+searchMovie :: String -> IO [(String, String)]
+searchMovie w = do
     cursor <- loadPage $ addictedUrl ++ searchExt ++ (urlEncode w)
     return $ cursor $// (getMovies)
 
@@ -148,10 +148,10 @@ mergeResults [] _ = []
 mergeResults _ [] = []
 mergeResults (a:as) (b:bs) = (a,b) : mergeResults as bs
 
-searchSubs :: String -> IO [(String, String)]
-searchSubs url = do
+searchSubs :: String -> MaybeT IO [(String, String)]
+searchSubs url = MaybeT $ do
     cursor <- loadPage url
-    return $ mergeResults
+    return $ Just $ mergeResults
         (cursor $// (getSubsHrefs))
         (map
             (\(a,b) -> a ++ " - " ++ b)
@@ -218,8 +218,24 @@ main = do
     maybeDone <- runMaybeT $ do
         movieChoise <- chooseLink searchRes
         let movie = composeLink movieChoise
-        subs <- searchSubs movie
-    return ()
+        subs <- searchSubs $ movie
+        subsChoise <- chooseLink subs
+        let file = composeLink subsChoise
+        loadFile movie file
+    case maybeDone of
+      Nothing -> putStrLn "Sorry, I'm failed"
+      Just x -> putStrLn $ "Done! File: " ++ x
+    {--
+    subs <- searchSubs <$> maybeMovie
+    maybeSubs <- runMaybeT $ do
+        subsChoise <- chooseLink <$> subs
+        return $ composeLink <$> subsChoise
+    maybeDone <- runMaybeT $ do
+        return $ loadFile <$> maybeMovie <*> maybeSubs
+    case maybeDone of
+      Nothing -> putStrLn "Couldn't download file"
+      Just x -> putStrLn "Done! File: " ++ x
+      --}
     {--
     case movie of
         Nothing -> return ()
@@ -237,6 +253,7 @@ main = do
 -- Test functions
 -------------------------------------------------------------------------------
 
+{--
 -- Test function for movie search
 movieTest :: IO (Maybe String)
 movieTest = do
@@ -250,3 +267,4 @@ subsTest = do
     subs <- searchSubsFile "./subtitles_page.html"
     choise <- chooseLink subs
     return $ composeLink <$> choise
+    --}
