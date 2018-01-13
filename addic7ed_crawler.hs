@@ -1,5 +1,4 @@
 {-# LANGUAGE OverloadedStrings #-}
---{-# LANGUAGE OverloadedStrings, FlexibleInstances, MultiParamTypeClasses, DeriveDataTypeable, CPP #-}
 
 import Data.Conduit.Binary (sinkFile)
 import Data.List (isInfixOf)
