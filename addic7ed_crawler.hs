@@ -1,5 +1,5 @@
---{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE OverloadedStrings, FlexibleInstances, MultiParamTypeClasses, DeriveDataTypeable, CPP #-}
+{-# LANGUAGE OverloadedStrings #-}
+--{-# LANGUAGE OverloadedStrings, FlexibleInstances, MultiParamTypeClasses, DeriveDataTypeable, CPP #-}
 
 import Data.Conduit.Binary (sinkFile)
 import Data.List (isInfixOf)
@@ -225,46 +225,25 @@ main = do
     case maybeDone of
       Nothing -> putStrLn "Sorry, I'm failed"
       Just x -> putStrLn $ "Done! File: " ++ x
-    {--
-    subs <- searchSubs <$> maybeMovie
-    maybeSubs <- runMaybeT $ do
-        subsChoise <- chooseLink <$> subs
-        return $ composeLink <$> subsChoise
-    maybeDone <- runMaybeT $ do
-        return $ loadFile <$> maybeMovie <*> maybeSubs
-    case maybeDone of
-      Nothing -> putStrLn "Couldn't download file"
-      Just x -> putStrLn "Done! File: " ++ x
-      --}
-    {--
-    case movie of
-        Nothing -> return ()
-        Just x -> do
-            subs <- searchSubs x
-            subsChoise <- chooseLink subs
-            let downloadLink = composeLink <$> subsChoise
-            case downloadLink of
-                Nothing -> return ()
-                Just y -> do
-                    loadFile x y
-                    --}
 
 -------------------------------------------------------------------------------
 -- Test functions
 -------------------------------------------------------------------------------
 
-{--
 -- Test function for movie search
 movieTest :: IO (Maybe String)
 movieTest = do
     searchRes <- searchMovieFile "./movie_page.html"
-    movieChoise <- chooseLink searchRes
-    return $ composeLink <$> movieChoise
+    maybeDone <- runMaybeT $ do
+        movieChoise <- chooseLink searchRes
+        return $ composeLink movieChoise
+    return maybeDone
 
 -- Test function for subtitles search
 subsTest :: IO (Maybe String)
 subsTest = do
     subs <- searchSubsFile "./subtitles_page.html"
-    choise <- chooseLink subs
-    return $ composeLink <$> choise
-    --}
+    maybeDone <- runMaybeT $ do
+        choise <- chooseLink subs
+        return $ composeLink choise
+    return maybeDone
