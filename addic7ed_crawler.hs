@@ -1,5 +1,4 @@
---{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE OverloadedStrings, FlexibleInstances, MultiParamTypeClasses, DeriveDataTypeable, CPP #-}
+{-# LANGUAGE OverloadedStrings #-}
 
 import Data.Conduit.Binary (sinkFile)
 import Data.List (isInfixOf)
@@ -18,7 +17,9 @@ import Data.List.Split (splitOn)
 import Text.XML.Cursor (Cursor, content, element, fromDocument, child, attributeIs, attribute, node, descendant, following,
                         (&/), ($//), (&|), (>=>))
 import Control.Monad.Trans.Resource (runResourceT)
+import Control.Monad.Trans.Maybe
 import Control.Monad.IO.Class -- liftIO
+import Control.Monad (liftM)
 
 addictedUrl = "http://www.addic7ed.com/"
 searchExt = "search.php?Submit=Search&search="
@@ -35,12 +36,10 @@ setReferer r req = req{requestHeaders = ("Referer", r) : requestHeaders req}
 
 getContentDisposition :: ResponseHeaders -> Maybe String
 getContentDisposition [] = Nothing
-getContentDisposition ((a,b):xs) =
-    if (a == "Content-Disposition") then
-        Just (T.unpack $ TE.decodeUtf8 b)
-    else
-        getContentDisposition xs
+getContentDisposition ((a,b):xs) | a == "Content-Disposition" = Just (T.unpack $ TE.decodeUtf8 b)
+                                 | otherwise = getContentDisposition xs
 
+loadPage :: String -> IO Cursor
 loadPage url = do
     putStrLn ("URL: " ++ url)
 
@@ -55,9 +54,10 @@ removeColon s = let repl ':' = '_'
                     repl c = c
                  in map repl s
 
-loadFile :: String -> String -> IO ()
-loadFile r url = do
+loadFile :: String -> String -> MaybeT IO String
+loadFile r url = MaybeT $ do
     putStrLn ("File URL: " ++ url)
+    putStrLn ("Referer: " ++ r)
 
     request <- (setReferer . TE.encodeUtf8 $ T.pack r) <$> setUserAgent <$> parseRequest url
     manager <- newManager defaultManagerSettings
@@ -66,14 +66,15 @@ loadFile r url = do
         response <- http request manager
 
         let cd = getContentDisposition $ responseHeaders response
-        let fileName = (!! 1) <$> ((splitOn "\"") <$> cd)
+        let fileName = removeColon <$> (!! 1) <$> ((splitOn "\"") <$> cd)
 
         liftIO $ putStrLn $ "File name: " ++ show fileName
 
         case fileName of
-            Nothing -> liftIO $ putStrLn "Failed to parse file name"
-            Just f ->
+            Nothing -> return Nothing
+            Just f -> do
                 responseBody response C.$$+- sinkFile f
+                return $ Just f
 
 -------------------------------------------------------------------------------
 -- Movie search
@@ -82,18 +83,23 @@ loadFile r url = do
 findMoviesHrefs :: Cursor -> [Cursor]
 findMoviesHrefs = element "table" >=> attributeIs "class" "tabel" >=> descendant >=> element "a"
 
+extractMoviesNames :: Cursor -> String
 extractMoviesNames = T.unpack . T.concat . content
 
+extractHrefs :: Cursor -> String
 extractHrefs = T.unpack . T.concat . attribute "href"
 
+getMovies :: Cursor -> [(String, String)]
 getMovies c =
     let hrefs = findMoviesHrefs c
     in map (\c -> ((extractHrefs c), (extractMoviesNames ((child c) !! 0)))) hrefs
 
+searchMovie :: String -> IO [(String, String)]
 searchMovie w = do
     cursor <- loadPage $ addictedUrl ++ searchExt ++ (urlEncode w)
     return $ cursor $// (getMovies)
 
+searchMovieFile :: FilePath -> IO [(String, String)]
 searchMovieFile f = do
     file <- D.readFile f
     let cursor = fromDocument file
@@ -103,38 +109,48 @@ searchMovieFile f = do
 -- Subtitle search
 -------------------------------------------------------------------------------
 
+findSubsTable :: Cursor -> [Cursor]
 findSubsTable = element "table" >=> attributeIs "class" "tabel95" >=> following
 
+findSubsLang :: Cursor -> [Cursor]
 findSubsLang = element "td" >=> attributeIs "class" "language" >=> descendant
 
+findSubsStat :: Cursor -> [Cursor]
 findSubsStat = element "td" >=> attributeIs "class" "newsDate" >=> attributeIs "colspan" "2" >=> descendant
 
+findSubsHrefs :: Cursor -> [Cursor]
 findSubsHrefs = element "a" >=> attributeIs "class" "buttonDownload"
 
+extractContent :: [Cursor] -> [String]
 extractContent z =
     let b = [ x | x@NodeContent {} <- ([ node y | y <- z ]) ]
     in map (T.unpack . (\(NodeContent a) -> a)) b
 
+getSubsLang :: Cursor -> [String]
 getSubsLang c =
     let langs = (findSubsTable >=> findSubsLang) c
     -- NOTE: language contains some strange content some filter was added to remove it
     in filter (not . isInfixOf "\n\t") $ extractContent langs
 
+getSubsHrefs :: Cursor -> [String]
 getSubsHrefs c =
     let hrefs = (findSubsTable >=> findSubsHrefs) c
     in map extractHrefs hrefs
 
+getSubsStat :: Cursor -> [String]
 getSubsStat c =
     let hrefs = (findSubsTable >=> findSubsStat) c
     in extractContent hrefs
 
+mergeResults :: [t0] -> [t1] -> [(t0, t1)]
 mergeResults [] _ = []
 mergeResults _ [] = []
 mergeResults (a:as) (b:bs) = (a,b) : mergeResults as bs
 
-searchSubs url = do
+searchSubs :: String -> MaybeT IO [(String, String)]
+searchSubs url = MaybeT $ do
     cursor <- loadPage url
-    return $ mergeResults
+    return $ Just $ mergeResults
         (cursor $// (getSubsHrefs))
         (map
             (\(a,b) -> a ++ " - " ++ b)
@@ -142,6 +158,7 @@ searchSubs url = do
                 (cursor $// (getSubsLang))
                 (cursor $// (getSubsStat))))
 
+searchSubsFile :: FilePath -> IO [(String, [Char])]
 searchSubsFile f = do
     file <- D.readFile f
     let cursor = fromDocument file
@@ -161,11 +178,11 @@ numerate :: Integer -> [String] -> [String]
 numerate _ [] = []
 numerate i (x:xs) = ((show i) ++ ": " ++ x) : (numerate (i + 1) xs)
 
-chooseLink :: [(String, String)] -> IO (Maybe String)
-chooseLink [] = do
+chooseLink :: [(String, String)] -> MaybeT IO String
+chooseLink [] = MaybeT $ do
     putStrLn "No result"
     return Nothing
-chooseLink res = do
+chooseLink res = MaybeT $ do
     -- Print search result
     putStrLn "Please choise the result or -1 to abort:"
     -- NOTE: Filter is added because subtitles comes with \n
@@ -180,47 +197,52 @@ chooseLink res = do
         else
             return Nothing
 
-composeLink :: Maybe String -> Maybe String
-composeLink Nothing = Nothing
-composeLink (Just u) = Just (addictedUrl ++ u)
+composeLink :: String -> String
+composeLink  = (addictedUrl ++)
 
 -------------------------------------------------------------------------------
 -- Main
 -------------------------------------------------------------------------------
 
+getNameToSearch :: IO String
 getNameToSearch = do
     putStr "Enter Serial Name: "
     x <- getLine
     return x
 
+main :: IO ()
 main = do
     what <- getNameToSearch
     searchRes <- searchMovie what
-    movieChoise <- chooseLink searchRes
-    let movie = composeLink movieChoise
-    case movie of
-        Nothing -> return ()
-        Just x -> do
-            subs <- searchSubs x
-            subsChoise <- chooseLink subs
-            let downloadLink = composeLink subsChoise
-            case downloadLink of
-                Nothing -> return ()
-                Just y -> do
-                    loadFile x y
+    maybeDone <- runMaybeT $ do
+        movieChoise <- chooseLink searchRes
+        let movie = composeLink movieChoise
+        subs <- searchSubs $ movie
+        subsChoise <- chooseLink subs
+        let file = composeLink subsChoise
+        loadFile movie file
+    case maybeDone of
+      Nothing -> putStrLn "Sorry, I'm failed"
+      Just x -> putStrLn $ "Done! File: " ++ x
 
 -------------------------------------------------------------------------------
 -- Test functions
 -------------------------------------------------------------------------------
 
 -- Test function for movie search
+movieTest :: IO (Maybe String)
 movieTest = do
     searchRes <- searchMovieFile "./movie_page.html"
-    movieChoise <- chooseLink searchRes
-    return $ composeLink movieChoise
+    maybeDone <- runMaybeT $ do
+        movieChoise <- chooseLink searchRes
+        return $ composeLink movieChoise
+    return maybeDone
 
 -- Test function for subtitles search
+subsTest :: IO (Maybe String)
 subsTest = do
     subs <- searchSubsFile "./subtitles_page.html"
-    choise <- chooseLink subs
-    return $ composeLink choise
+    maybeDone <- runMaybeT $ do
+        choise <- chooseLink subs
+        return $ composeLink choise
+    return maybeDone
